@@ -196,6 +196,75 @@ def _check_tolerances(dtype: torch.dtype) -> tuple[float, float, float | None]:
     return rtol, atol, atol_frac
 
 
+_RngState = tuple[torch.Tensor, list[torch.Tensor] | None]
+
+
+def _rng_state() -> _RngState:
+    """The CPU generator's state, and every CUDA generator's once CUDA is initialized."""
+    cuda = torch.cuda.get_rng_state_all() if torch.cuda.is_initialized() else None
+    return torch.random.get_rng_state(), cuda
+
+
+def _set_rng_state(state: _RngState) -> None:
+    cpu, cuda = state
+    torch.random.set_rng_state(cpu)
+    if cuda is not None:
+        torch.cuda.set_rng_state_all(cuda)
+
+
+def _eager_draws(
+    fn: Callable[..., Any],
+    args: tuple[Any, ...],
+    rng: _RngState,
+) -> bool:
+    """Whether fn's result or the inputs it mutates depend on the generator.
+
+    Only consulted after a mismatch, to tell "the edit broke it" apart from "this
+    function draws". Drawing has to be detected by running from two DIFFERENT generator
+    states -- running twice from the same state proves nothing, because eager is
+    perfectly reproducible at a fixed seed. What makes the comparison meaningless is that
+    inductor lowers random ops to its own philox and differs from eager at the same seed
+    by design.
+    """
+    saved = _rng_state()
+    try:
+        _set_rng_state(rng)
+        first_args = copy.deepcopy(args)
+        first = pytree.tree_leaves((fn(*first_args), first_args))
+        seed = int(torch.random.initial_seed()) + 1
+        torch.random.default_generator.manual_seed(seed)
+        if torch.cuda.is_initialized():
+            torch.cuda.manual_seed_all(seed)
+        second_args = copy.deepcopy(args)
+        second = pytree.tree_leaves((fn(*second_args), second_args))
+    except Exception:
+        return False
+    finally:
+        # This runs only to answer a question; the caller's streams must not move.
+        _set_rng_state(saved)
+    pairs = [
+        (a, b)
+        for a, b in zip(first, second)
+        if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor)
+    ]
+    for a, b in pairs:
+        if a.shape != b.shape or a.dtype != b.dtype:
+            return True
+        rtol, atol, atol_frac = _check_tolerances(a.dtype)
+        # Cap it exactly as the real comparison does. Using the raw absolute tolerance
+        # here made a small-magnitude random fn look deterministic to this function while
+        # looking wrong to the caller, so it was reported as a bad hand-edit instead of
+        # being skipped.
+        if atol_frac is not None:
+            finite = _finite_mask(a)
+            values = a[finite] if finite is not None else a.flatten()
+            if values.numel():
+                atol = min(atol, atol_frac * values.double().abs().max().item())
+        if not _allclose(a, b, rtol, atol):
+            return True
+    return False
+
+
 def _allclose(a: torch.Tensor, b: torch.Tensor, rtol: float, atol: float) -> bool:
     """torch.allclose, but tolerant of dtypes that have no comparison kernel.
 
@@ -227,9 +296,11 @@ def _finite_mask(t: torch.Tensor) -> torch.Tensor | None:
 
 def _verify_against_eager(
     fn: Callable[..., Any],
+    args: tuple[Any, ...],
     reference_args: tuple[Any, ...],
     produced: Any,
     path: str,
+    rng: _RngState,
 ) -> None:
     """Re-run fn eagerly on a pre-call copy of the inputs and compare the results.
 
@@ -257,11 +328,24 @@ def _verify_against_eager(
             )
     got_leaves = [t for t in got_flat if isinstance(t, torch.Tensor)]
     want_leaves = [t for t in want_flat if isinstance(t, torch.Tensor)]
-    for i, (got, want) in enumerate(zip(got_leaves, want_leaves)):
+    # Outputs AND inputs: a graph is free to mutate what it was handed, and a fn whose
+    # whole job is an in-place write returns nothing else to compare.
+    compared = [
+        (f"output {i} of the artifact at {path}", got, want)
+        for i, (got, want) in enumerate(zip(got_leaves, want_leaves))
+    ]
+    compared += [
+        (f"input {j} as the artifact at {path} left it", got, want)
+        for j, (got, want) in enumerate(
+            zip(pytree.tree_leaves(args), pytree.tree_leaves(reference_args))
+        )
+        if isinstance(got, torch.Tensor)
+    ]
+    for label, got, want in compared:
         rtol, atol, atol_frac = _check_tolerances(got.dtype)
         if (got.shape, got.dtype, got.device) != (want.shape, want.dtype, want.device):
             raise _precompile_error(
-                f"{_CHECK_ENV}: output {i} of the artifact at {path} is "
+                f"{_CHECK_ENV}: {label} is "
                 f"{tuple(got.shape)}/{got.dtype}/{got.device} but eager gives "
                 f"{tuple(want.shape)}/{want.dtype}/{want.device}."
             )
@@ -275,7 +359,7 @@ def _verify_against_eager(
         ):
             bad = int((finite_got != finite_want).sum())
             raise _precompile_error(
-                f"{_CHECK_ENV}: output {i} of the artifact at {path} disagrees with "
+                f"{_CHECK_ENV}: {label} disagrees with "
                 f"{name} about where the result is finite "
                 f"({bad} of {got.numel()} elements). A kernel that leaves part of its "
                 "output unwritten reads back uninitialized memory, which looks like "
@@ -305,8 +389,18 @@ def _verify_against_eager(
             rel = f"{(diff[significant] / reference[significant]).max().item():.3e}"
         else:
             rel = "n/a (reference is all near-zero)"
+        if _eager_draws(fn, reference_args, rng):
+            log.warning(
+                "%s: %s draws from the generator, and inductor lowers random ops to its "
+                "own philox, which differs from eager at the same seed by design -- so "
+                "comparing the two says nothing. Skipping the check for %s.",
+                _CHECK_ENV,
+                name,
+                path,
+            )
+            return
         raise _precompile_error(
-            f"{_CHECK_ENV}: output {i} of the artifact at {path} does not match "
+            f"{_CHECK_ENV}: {label} does not match "
             f"{name} run eagerly on the same inputs "
             f"(max abs diff {max_abs:.3e}, max rel diff {rel}, reference "
             f"magnitude {magnitude:.3e}, tolerances rtol={rtol} atol={atol:.3e}). "
@@ -1178,8 +1272,22 @@ class ExportedPythonArtifact:
                 self._path,
             )
             return loaded(*args)
+        # Three states matter here. `before` is what the artifact saw (CPU and, once
+        # initialized, CUDA generators); the reference run is rewound to it so a draw is
+        # not mistaken for a bad edit. `after` is what the caller must be left with --
+        # restoring `before` instead would discard whatever the artifact consumed and
+        # freeze the caller's stream, so a random function would return the same numbers
+        # on every checked call.
+        before = _rng_state()
         produced = loaded(*args)
-        _verify_against_eager(self._fn, reference, produced, self._path)
+        after = _rng_state()
+        try:
+            _set_rng_state(before)
+            _verify_against_eager(
+                self._fn, args, reference, produced, self._path, before
+            )
+        finally:
+            _set_rng_state(after)
         return produced
 
 
