@@ -5810,6 +5810,80 @@ class TestExportPython(TestCase):
         self.assertEqual(m.running_mean, ref.running_mean)
         self.assertEqual(m.running_var, ref.running_var)
 
+    def test_kwargs_bound_positionally(self, device):
+        path = self._tmp_path("kw.py")
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+
+        @torch.compiler.export_python(path=path, backend="eager")
+        def run(a, b):
+            return a - b
+
+        # A keyword call binds onto (a, b) positionally and runs the artifact.
+        self.assertEqual(run(a=x, b=x + 1), x - (x + 1))
+
+    def test_keyword_only_params_rejected(self, device):
+        @torch.compiler.export_python(path=self._tmp_path("ko.py"), backend="eager")
+        def run(a, *, b):
+            return a + b
+
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+        with self.assertRaisesRegex(TypeError, "declare keyword-only parameters"):
+            run(x, b=x)
+
+    def test_positional_defaults_are_canonicalized(self, device):
+        default = make_tensor((4,), device=device, dtype=torch.float32)
+
+        @torch.compiler.export_python(path=self._tmp_path("posdef.py"), backend="eager")
+        def run(a, b=default, c=default):
+            return a + b + c
+
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+        other = make_tensor((4,), device=device, dtype=torch.float32)
+        self.assertEqual(run(x, c=other), x + default + other)
+        self.assertEqual(run(x, b=other), x + other + default)
+
+    def test_example_inputs_bound_like_a_call(self, device):
+        default = make_tensor((4,), device=device, dtype=torch.float32)
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+
+        @torch.compiler.export_python(
+            path=self._tmp_path("ex_default.py"), backend="eager", example_inputs=[x]
+        )
+        def with_default(a, b=default):
+            return a + b
+
+        # The default is filled into the capture's arity, so a call omitting it binds.
+        self.assertEqual(with_default(x), x + default)
+
+        @torch.compiler.export_python(
+            path=self._tmp_path("ex_scalar.py"), backend="eager", example_inputs=[x, 2]
+        )
+        def scaled(a, s):
+            return a * s
+
+        with self.assertRaisesRegex(TypeError, "only Tensor pytrees"):
+            scaled(x, x)
+
+    def test_non_tensor_arguments_rejected(self, device):
+        @torch.compiler.export_python(path=self._tmp_path("scalar.py"), backend="eager")
+        def run(inp, scale=1):
+            return inp * scale
+
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+        with self.assertRaisesRegex(TypeError, "only Tensor pytrees"):
+            run(x, 1)
+
+    def test_var_kwargs_rejected(self, device):
+        # A fn declaring **kwargs cannot be laid out positionally once extra keyword
+        # args are passed.
+        @torch.compiler.export_python(path=self._tmp_path("varkw.py"), backend="eager")
+        def run(a, **kw):
+            return a + kw["b"]
+
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+        with self.assertRaisesRegex(TypeError, r"\*\*kwargs"):
+            run(x, b=x)
+
     def test_decompositions_forwarded(self, device):
         from unittest.mock import patch
 
@@ -5855,6 +5929,25 @@ class TestExportPython(TestCase):
         self.assertEqual(run2(x), x + 1)
         with open(path, encoding="utf-8") as f:
             self.assertEqual(f.read(), first)
+
+    def test_none_and_nested_module_arguments_name_their_own_cause(self, device):
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+
+        @torch.compiler.export_python(path=self._tmp_path("none.py"), backend="eager")
+        def optional(inp, mask=None):
+            return inp + 1
+
+        with self.assertRaisesRegex(TypeError, "does not support None arguments"):
+            optional(x)
+
+        @torch.compiler.export_python(
+            path=self._tmp_path("nestmod.py"), backend="eager"
+        )
+        def nested(mods, inp):
+            return mods[0](inp)
+
+        with self.assertRaisesRegex(TypeError, "must be passed directly"):
+            nested([torch.nn.Linear(4, 4).to(device)], x)
 
     def test_artifact_does_not_bake_the_capture_thread_count(self, device):
         # See the cpp.dynamic_threads pin in PrecompiledModule._compile. Capture runs in
