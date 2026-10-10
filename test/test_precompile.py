@@ -3680,6 +3680,77 @@ class TestPrecompile(TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
 
+    def test_inlined_forward_names_the_artifact_in_tracebacks(self):
+        # The emitted source is meant to be edited, so a traceback out of it has to name
+        # the file the reader edits, with its source lines.
+        import traceback
+
+        from torch._precompile import _make_inlined_forward
+
+        code, _cache = _precompile_pair(lambda a: a + 1, torch.ones(2), backend="eager")
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "artifact.py")
+            with open(path, "w") as f:
+                f.write(code)
+            forward = _make_inlined_forward(code, warn=False, filename=path)
+            # Not assertRaises, which clears the traceback's frames.
+            try:
+                forward(torch.ones(3))
+                self.fail("a wrong-shape input was accepted")
+            except PrecompileError as e:
+                frames = traceback.extract_tb(e.__traceback__)
+        in_artifact = [fr for fr in frames if fr.filename == path]
+        self.assertTrue(in_artifact, frames)
+        self.assertTrue(all(fr.line for fr in in_artifact), in_artifact)
+        # With no filename the source still runs from a real file, which triton needs.
+        anonymous = _make_inlined_forward(code, warn=False)
+        self.assertTrue(os.path.exists(anonymous.__code__.co_filename))
+
+    def test_load_names_the_artifact_file_in_tracebacks(self):
+        import traceback
+
+        with tempfile.TemporaryDirectory() as d:
+            artifact, cache = os.path.join(d, "a.py"), os.path.join(d, "a.cache")
+            with capture(
+                lambda a: a + 1,
+                artifact_path=artifact,
+                cache_path=cache,
+                tracer=MakeFxTracer(),
+                backend="eager",
+            ) as cap:
+                cap(torch.ones(2))
+            f = load(artifact, cache)
+            try:
+                f(torch.ones(3))
+                self.fail("a wrong-shape input was accepted")
+            except PrecompileError as e:
+                frames = traceback.extract_tb(e.__traceback__)
+        self.assertTrue(any(fr.filename == artifact for fr in frames), frames)
+
+    def test_generated_source_says_it_may_be_edited(self):
+        # The artifact's own header is the only documentation most readers will see. It
+        # used to carry a generated-code "do not edit" banner, which is exactly backwards
+        # for source whose purpose is to be tuned in place.
+        for backend in ("eager", "inductor"):
+            code, _cache = _precompile_pair(
+                lambda a: a + 1, torch.ones(2), backend=backend
+            )
+            self.assertIn("Editing it is supported", code)
+
+    @unittest.skipIf(not TEST_CUDA, "needs CUDA")
+    def test_load_from_a_code_string_gives_triton_a_file(self):
+        # Kernels are module-level code, and @triton.jit reads its own source off disk:
+        # it refuses a function whose module has no file. A caller loading from a string
+        # has no path to offer, so load parks a copy where triton can find it rather
+        # than failing on every CUDA artifact.
+        code, cache = _precompile_pair(
+            lambda a: (a * 2).relu(), torch.ones(64, device="cuda")
+        )
+        self.assertIn("@triton.jit", code)
+        loaded = _load_pair(code, cache)
+        x = torch.randn(64, device="cuda")
+        self.assertEqual(loaded(x), (x * 2).relu())
+
 
 class _FilesModel(torch.nn.Module):
     def __init__(self):
