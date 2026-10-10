@@ -736,6 +736,10 @@ def user_defined_triton_kernel_transitive_closure_source_code(
     return compile_wrapper.getvalue()
 
 
+# benchmark_kernel and benchmark_combo_kernel append it to every kernel's source, last.
+_KERNEL_BENCHMARK_HARNESS = re.compile(r"^def get_args\(\):$", re.MULTILINE)
+
+
 def _escape_triton_kernel_source_for_wrapper(src: str) -> str:
     """Escape src for a '''...''' literal, optionally nested in an r\"\"\"...\"\"\" block."""
     src = src.replace("\\", "\\\\")
@@ -4024,6 +4028,14 @@ class PythonWrapperCodegen(CodeGen):
             return
 
         self.benchmark_compiled_module(output)
+        # A module-level kernel's harness stays in its own module, which a run of this
+        # one as a script does not otherwise load (see emit_triton_kernel_definition).
+        kernel_modules = [
+            get_hash(src.strip())
+            for _, src in self.kernel_sources.values()
+            if _KERNEL_BENCHMARK_HARNESS.search(src)
+        ]
+        modules_arg = f", kernel_modules={kernel_modules!r}" if kernel_modules else ""
 
         output.writelines(["", "", 'if __name__ == "__main__":'])
         with output.indent():
@@ -4033,7 +4045,8 @@ class PythonWrapperCodegen(CodeGen):
                     "args = get_args()",
                     (
                         f"compiled_module_main('{get_benchmark_name()}', "
-                        "lambda times, repeat: benchmark_compiled_module(args, times=times, repeat=repeat))"
+                        "lambda times, repeat: benchmark_compiled_module(args, times=times, repeat=repeat)"
+                        f"{modules_arg})"
                     ),
                 ]
             )
@@ -4148,7 +4161,7 @@ class PythonWrapperCodegen(CodeGen):
         # harness to every kernel. It stays in the per-kernel modules the pool builds,
         # which is where benchmark_all_kernels looks for it, but at module level each
         # kernel's __main__ block would run whenever the wrapper does.
-        if harness := re.search(r"^def get_args\(\):$", src_code, re.MULTILINE):
+        if harness := _KERNEL_BENCHMARK_HARNESS.search(src_code):
             src_code = src_code[: harness.start()]
         if "if __name__ == '__main__':" in src_code:
             raise AssertionError(f"kernel {kernel_name} kept its benchmark harness")
