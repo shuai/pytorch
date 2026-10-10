@@ -1116,6 +1116,23 @@ def export_python(
     .. warning::
         This API is experimental and subject to change.
 
+    .. warning::
+        An artifact is only valid on the machine type that produced it. The emitted
+        source hardcodes the CPU vector width inductor chose and, for CUDA, the compute
+        capability of the producing GPU; neither is re-checked. (A tensor on a different
+        device index than at capture is rejected when the artifact is called.) Running
+        a CPU artifact under a different ISA than it captured on is unsafe in both
+        directions, because the loop stride is baked at capture while the ISA is
+        re-picked when the artifact compiles: a *wider* ISA writes past the end of the
+        output, corrupting the heap, and a *narrower* one leaves roughly half of each
+        vectorized strip unwritten, so the output is part uninitialized memory. Neither
+        raises. ``torch._inductor.config.cpp.simdlen`` and ``ATEN_CPU_CAPABILITY``
+        change the ISA on one machine, so they count as part of the machine type.
+        Running a CUDA artifact on a different architecture fails with a kernel-image
+        error. Commit an artifact only alongside the machine type it captured on, and
+        regenerate (delete ``path``) when that changes; nothing detects the change for
+        you.
+
     ``export_python`` is a decorator over ``torch.compiler.precompile``'s make_fx capture.
     On the first run in an environment it precompiles the decorated function (make_fx
     capture plus backend lowering) and writes the emitted, self-contained Python
@@ -1142,7 +1159,12 @@ def export_python(
             after a source edit is the expected failure mode; delete ``path`` to force
             a re-precompile. Loading any existing artifact also warns before executing
             it because ``path`` is trusted executable Python and may have been edited or
-            replaced. New files use the permissions selected by the process umask.
+            replaced. A CUDA artifact additionally embeds inductor's kernel-cache paths,
+            so it is not byte-stable across machines or users even when the numerics
+            are. A Triton kernel listed in the artifact's ``KERNEL_CONFIGS`` launches
+            with the config autotuning chose at capture, so a cold start does not retune
+            it; a kernel missing there autotunes on its first launch. New files use the
+            permissions selected by the process umask.
         backend: How the captured graph is realized: ``"inductor"`` (default) or
             ``"eager"``. Forwarded to the capture.
         tracer: Capture front-end; ``"make_fx"`` (default) is the only one
