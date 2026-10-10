@@ -1118,19 +1118,22 @@ def export_python(
 
     .. warning::
         An artifact is only valid on the machine type that produced it. The emitted
-        source hardcodes the CPU vector width inductor chose and, for CUDA, the compute
-        capability of the producing GPU; neither is re-checked. (A tensor on a different
-        device index than at capture is rejected when the artifact is called.) Running
-        a CPU artifact under a different ISA than it captured on is unsafe in both
-        directions, because the loop stride is baked at capture while the ISA is
-        re-picked when the artifact compiles: a *wider* ISA writes past the end of the
-        output, corrupting the heap, and a *narrower* one leaves roughly half of each
-        vectorized strip unwritten, so the output is part uninitialized memory. Neither
-        raises. ``torch._inductor.config.cpp.simdlen`` and ``ATEN_CPU_CAPABILITY``
-        change the ISA on one machine, so they count as part of the machine type.
-        Running a CUDA artifact on a different architecture fails with a kernel-image
-        error. Commit an artifact only alongside the machine type it captured on, and
-        regenerate (delete ``path``) when that changes; nothing detects the change for
+        source hardcodes the CPU vector width inductor chose and, for CUDA, the
+        compute capability of the producing GPU; the compute capability is never
+        re-checked. (A tensor on a different device index than at capture is
+        rejected when the artifact is called.) Running a CPU artifact under a
+        different ISA than it captured on is unsafe in both directions, because the
+        loop stride is baked at capture while the ISA is re-picked when the artifact
+        compiles: a *wider* ISA writes past the end of the output, corrupting the
+        heap, and a *narrower* one leaves roughly half of each vectorized strip
+        unwritten, so the output is part uninitialized memory. Neither raises.
+        ``torch._inductor.config.cpp.simdlen`` and ``ATEN_CPU_CAPABILITY`` change
+        the ISA on one machine, so they count as part of the machine type, and an
+        artifact containing a C++ kernel records the ISA it was generated against
+        and refuses to run under any other. Running a CUDA artifact on a different
+        architecture fails with a kernel-image error. Commit an artifact only
+        alongside the machine type it captured on, and regenerate (delete ``path``)
+        when that changes; apart from the CPU ISA, nothing detects the change for
         you.
 
     ``export_python`` is a decorator over ``torch.compiler.precompile``'s make_fx capture.
@@ -1149,7 +1152,7 @@ def export_python(
     constants over in ``fn`` instead. A ``None`` argument, including a ``None``
     default the caller never passes, is rejected the same way. A ``fn`` that
     declares keyword-only parameters is rejected, since they are not expressible in
-    the artifact's positional convention. Five things that ``make_fx`` or the code
+    the artifact's positional convention. Six things that ``make_fx`` or the code
     generator resolves without emitting a guard are recorded as comment stamps and
     checked on every call: each ``nn.Module`` argument's per-submodule ``training``
     state, which input tensors shared memory at capture (aliasing decides what an
@@ -1163,7 +1166,11 @@ def export_python(
     the default dtype and device a factory op with no explicit argument takes, and
     whether deterministic algorithms were enabled when inductor chose between a
     deterministic and an atomic lowering (checked one-way -- capturing with
-    determinism on and calling with it off is safe, the reverse is not). What is *not*
+    determinism on and calling with it off is safe, the reverse is not), and, for an
+    artifact containing a C++ kernel, the CPU vector ISA it was generated against (the
+    vector width is baked into the loop strides while the ISA is re-picked at compile
+    time, so a narrower host would leave part of the output uninitialized with no
+    error at all -- this one refuses to run rather than warning). What is *not*
     guarded is a change in *how* two aliased inputs overlap: when capture and the call
     both pass intersecting views, the artifact runs with capture's relative offsets
     baked in and may compute the wrong thing. ``torch.compile`` has the same hole
