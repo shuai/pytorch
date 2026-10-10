@@ -5944,6 +5944,260 @@ class TestExportPython(TestCase):
         self.assertEqual(m.running_mean, ref.running_mean)
         self.assertEqual(m.running_var, ref.running_var)
 
+    @parametrize("backend", ("eager", "inductor"))
+    def test_concurrent_first_calls_precompile_once(self, device, backend):
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+
+        @torch.compiler.export_python(
+            path=self._tmp_path("concurrent.py"), backend=backend
+        )
+        def run(inp):
+            return inp + 1
+
+        real = torch._precompile.PrecompiledModule
+
+        # Count captures; the decorator builds one PrecompiledModule behind its
+        # double-checked lock even under the racing first calls.
+        class _Counting:
+            def __init__(self):
+                self.n = 0
+
+            def __call__(self, *a, **k):
+                self.n += 1
+                return real(*a, **k)
+
+        counting = _Counting()
+        n = 8
+        barrier = threading.Barrier(n)
+        results: list = [None] * n
+
+        def worker(i):
+            barrier.wait()
+            results[i] = run(x)
+
+        with mock.patch.object(torch._precompile, "PrecompiledModule", counting):
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        # The double-checked lock must precompile exactly once despite the race.
+        self.assertEqual(counting.n, 1)
+        for r in results:
+            self.assertEqual(r, x + 1)
+
+    def test_concurrent_first_launches_are_serialized(self, device):
+        import time
+
+        from torch.compiler._export_python import ExportedPythonArtifact
+
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+
+        @torch.compiler.export_python(
+            path=self._tmp_path("first_launch.py"), backend="eager"
+        )
+        def run(inp):
+            return inp + 1
+
+        real_load = ExportedPythonArtifact._load
+        state_lock = threading.Lock()
+        calls = 0
+        first_running = False
+        overlapped = False
+        seen = {}
+
+        def spy_load(artifact, code, *, from_disk):
+            real_entry = real_load(artifact, code, from_disk=from_disk)
+
+            def entry(*args):
+                nonlocal calls, first_running, overlapped
+                with state_lock:
+                    calls += 1
+                    first = calls == 1
+                    overlapped = overlapped or first_running
+                    first_running = first_running or first
+                try:
+                    if first:
+                        time.sleep(0.05)
+                    return real_entry(*args)
+                finally:
+                    if first:
+                        with state_lock:
+                            first_running = False
+
+            seen["artifact"], seen["entry"] = artifact, entry
+            return entry
+
+        n = 4
+        barrier = threading.Barrier(n)
+        results: list = [None] * n
+
+        def worker(i):
+            barrier.wait()
+            results[i] = run(x)
+
+        with mock.patch.object(ExportedPythonArtifact, "_load", spy_load):
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        self.assertFalse(overlapped)
+        self.assertEqual(calls, n)
+        # After the first success the wrapper is gone and later calls take no lock.
+        self.assertIs(seen["artifact"]._loaded, seen["entry"])
+        for r in results:
+            self.assertEqual(r, x + 1)
+
+    def test_concurrent_distinct_captures_are_serialized(self, device):
+        import time
+
+        import torch._precompile as precompile_impl
+
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+        runs = []
+        for i in range(4):
+
+            @torch.compiler.export_python(
+                path=self._tmp_path(f"concurrent_{i}.py"), backend="eager"
+            )
+            def run(inp):
+                return inp + 1
+
+            runs.append(run)
+
+        real = precompile_impl._capture
+        state_lock = threading.Lock()
+        active = 0
+        max_active = 0
+
+        def spy(*args, **kwargs):
+            nonlocal active, max_active
+            with state_lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.02)
+                return real(*args, **kwargs)
+            finally:
+                with state_lock:
+                    active -= 1
+
+        barrier = threading.Barrier(len(runs))
+        results: list = [None] * len(runs)
+
+        def worker(i):
+            barrier.wait()
+            results[i] = runs[i](x)
+
+        with mock.patch.object(precompile_impl, "_capture", spy):
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        self.assertEqual(max_active, 1)
+        for result in results:
+            self.assertEqual(result, x + 1)
+
+    def test_export_and_direct_precompile_captures_are_serialized(self, device):
+        import time
+
+        import torch._precompile as precompile_impl
+
+        x = make_tensor((4,), device=device, dtype=torch.float32)
+
+        @torch.compiler.export_python(
+            path=self._tmp_path("direct_concurrent.py"), backend="eager"
+        )
+        def exported(inp):
+            return inp + 1
+
+        real_capture = precompile_impl._capture
+        state_lock = threading.Lock()
+        active = 0
+        max_active = 0
+
+        def spy(*args, **kwargs):
+            nonlocal active, max_active
+            with state_lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.05)
+                return real_capture(*args, **kwargs)
+            finally:
+                with state_lock:
+                    active -= 1
+
+        barrier = threading.Barrier(2)
+        errors = []
+
+        def export_worker():
+            try:
+                barrier.wait()
+                exported(x)
+            except BaseException as e:
+                errors.append(e)
+
+        def precompile_worker():
+            try:
+                barrier.wait()
+                _precompile_pair(lambda inp: inp + 2, x, backend="eager")
+            except BaseException as e:
+                errors.append(e)
+
+        with mock.patch.object(precompile_impl, "_capture", spy):
+            threads = [
+                threading.Thread(target=export_worker),
+                threading.Thread(target=precompile_worker),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(20)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(max_active, 1)
+
+    def test_nested_first_capture_does_not_deadlock(self, device):
+        code = textwrap.dedent(
+            f"""
+            import os
+            import tempfile
+            import torch
+
+            with tempfile.TemporaryDirectory() as d:
+                example = torch.ones(1, device={device!r})
+
+                @torch.compiler.export_python(
+                    path=os.path.join(d, "inner.py"),
+                    backend="eager",
+                    example_inputs=[example],
+                )
+                def inner(x):
+                    return x + 1
+
+                @torch.compiler.export_python(
+                    path=os.path.join(d, "outer.py"), backend="eager"
+                )
+                def outer(x):
+                    return inner(x) * 2
+
+                torch.testing.assert_close(outer(example), (example + 1) * 2)
+            """
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_clobbered_non_artifact_source_raises_clean_error(self, device):
         # A hand-edit that drops forward() names the path rather than raising a raw
         # KeyError.
@@ -6113,6 +6367,20 @@ class TestExportPython(TestCase):
                     PrecompileError, "unexpected error occurred .*boom"
                 ):
                     loaded(x)
+
+    def test_recursive_decorated_function_raises_not_hangs(self, device):
+        path = self._tmp_path("recursive.py")
+        depth = [1]
+
+        @torch.compiler.export_python(path=path, backend="eager")
+        def f(inp):
+            if depth[0] > 0:
+                depth[0] -= 1
+                return f(inp + 1)
+            return inp * 2
+
+        with self.assertRaisesRegex(PrecompileError, "re-entrant call"):
+            f(make_tensor((4,), device=device, dtype=torch.float32))
 
     def test_artifact_deleted_between_gate_and_read_regenerates(self, device):
         # A peer deleting the artifact to force a regenerate must not surface as a bare
