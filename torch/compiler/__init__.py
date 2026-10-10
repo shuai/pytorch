@@ -1181,8 +1181,12 @@ def export_python(
             so it is not byte-stable across machines or users even when the numerics
             are. A Triton kernel listed in the artifact's ``KERNEL_CONFIGS`` launches
             with the config autotuning chose at capture, so a cold start does not retune
-            it; a kernel missing there autotunes on its first launch. New files use the
-            permissions selected by the process umask.
+            it; a kernel missing there autotunes on its first launch. Concurrent first
+            writers use first-publisher-wins semantics: every loser loads the complete
+            artifact that won instead of executing different generated source. (On a
+            filesystem without hard links this degrades to last-writer-wins; the file is
+            never partial either way.) New files use the permissions selected by the
+            process umask.
         backend: How the captured graph is realized: ``"inductor"`` (default) or
             ``"eager"``. Forwarded to the capture.
         tracer: Capture front-end; ``"make_fx"`` (default) is the only one
